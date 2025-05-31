@@ -33,7 +33,7 @@ export function EventTab({ className }: EventTabProps) {
 
     try {
       const response = await fetch(
-        `http://localhost:8000/api/events?page=${page}&size=${pageSize}`
+        `http://localhost:8000/events?page=${page}&size=${pageSize}`
       );
       const data = await response.json();
       setEvents(data.events);

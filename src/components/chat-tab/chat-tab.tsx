@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useWebSocketStore } from "@/store/websocket-store";
 import { toast } from "sonner";
-import { Download, Mic, Video, Paperclip, Send } from "lucide-react";
+import { Download, Mic, Video, Paperclip, Send, Square } from "lucide-react";
 import dynamic from 'next/dynamic';
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -36,11 +36,18 @@ export function ChatTab({ className }: ChatTabProps) {
   const [selectedFiles, setSelectedFiles] = useState<Array<{ file: File; url: string }>>([]);
   const [isAudioRecording, setIsAudioRecording] = useState(false);
   const [isVideoRecording, setIsVideoRecording] = useState(false);
-  const [isStreaming, setIsStreaming] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { isConnected, sessionId, selectedApp } = useWebSocketStore();
   const scrollRef = useRef<HTMLDivElement>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const currentStreamingMessage = useRef<Message | null>(null);
+  
+  // Media recording refs
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const videoChunksRef = useRef<Blob[]>([]);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const timerRef = useRef<NodeJS.Timeout | undefined>(undefined);
 
   // Smooth scrolling to bottom
   const scrollToBottom = useCallback(() => {
@@ -56,13 +63,43 @@ export function ChatTab({ className }: ChatTabProps) {
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
-  const handleSendMessage = async () => {
-    if (!input.trim() || !isConnected || isStreaming) return;
-
-    // Cancel any ongoing streaming
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
+  }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+      }
+      stopRecording();
+    };
+  }, []);
+
+  const startTimer = () => {
+    setRecordingTime(0);
+    timerRef.current = setInterval(() => {
+      setRecordingTime(prev => prev + 1);
+    }, 1000);
+  };
+
+  const stopTimer = () => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+    }
+    setRecordingTime(0);
+  };
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const handleSendMessage = async () => {
+    if (!input.trim() || !isConnected || isAudioRecording || isVideoRecording) return;
 
     const userMessage: Message = {
       id: crypto.randomUUID(),
@@ -74,10 +111,6 @@ export function ChatTab({ className }: ChatTabProps) {
 
     setMessages(prev => [...prev, userMessage]);
     setInput("");
-    setIsStreaming(true);
-
-    // Create new abort controller for this request
-    abortControllerRef.current = new AbortController();
 
     try {
       const response = await fetch('/run_sse', {
@@ -106,7 +139,6 @@ export function ChatTab({ className }: ChatTabProps) {
           },
           streaming: true
         }),
-        signal: abortControllerRef.current.signal
       });
 
       if (!response.ok) {
@@ -197,30 +229,13 @@ export function ChatTab({ className }: ChatTabProps) {
       }
 
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        console.log('Request was aborted');
-        return;
-      }
-      
       console.error('Streaming error:', error);
       toast.error('Failed to send message. Please try again.');
       
       // Remove any incomplete streaming message
       setMessages(prev => prev.filter(msg => !msg.isStreaming));
-    } finally {
-      setIsStreaming(false);
-      abortControllerRef.current = null;
     }
   };
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-    };
-  }, []);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
@@ -235,45 +250,128 @@ export function ChatTab({ className }: ChatTabProps) {
     setSelectedFiles(prev => prev.filter((_, i) => i !== index));
   };
 
-  const startAudioRecording = () => {
-    setIsAudioRecording(true);
-    toast.info("Audio recording started");
+  const startAudioRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const audioFile = new File([audioBlob], 'audio-recording.webm', { type: 'audio/webm' });
+        
+        // Add the audio file to selected files
+        setSelectedFiles(prev => [...prev, {
+          file: audioFile,
+          url: URL.createObjectURL(audioBlob)
+        }]);
+
+        // Stop all tracks
+        stream.getTracks().forEach(track => track.stop());
+      };
+
+      mediaRecorder.start();
+      setIsAudioRecording(true);
+      startTimer();
+      toast.success("Audio recording started");
+    } catch (error) {
+      console.error('Error accessing microphone:', error);
+      toast.error("Failed to access microphone");
+    }
   };
 
-  const stopAudioRecording = () => {
-    setIsAudioRecording(false);
-    toast.info("Audio recording stopped");
+  const startVideoRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      videoChunksRef.current = [];
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          videoChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const videoBlob = new Blob(videoChunksRef.current, { type: 'video/webm' });
+        const videoFile = new File([videoBlob], 'video-recording.webm', { type: 'video/webm' });
+        
+        // Add the video file to selected files
+        setSelectedFiles(prev => [...prev, {
+          file: videoFile,
+          url: URL.createObjectURL(videoBlob)
+        }]);
+
+        // Stop all tracks
+        stream.getTracks().forEach(track => track.stop());
+        if (videoRef.current) {
+          videoRef.current.srcObject = null;
+        }
+      };
+
+      mediaRecorder.start();
+      setIsVideoRecording(true);
+      startTimer();
+      toast.success("Video recording started");
+    } catch (error) {
+      console.error('Error accessing camera:', error);
+      toast.error("Failed to access camera");
+    }
   };
 
-  const startVideoRecording = () => {
-    setIsVideoRecording(true);
-    toast.info("Video recording started");
-  };
-
-  const stopVideoRecording = () => {
-    setIsVideoRecording(false);
-    toast.info("Video recording stopped");
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && (isAudioRecording || isVideoRecording)) {
+      mediaRecorderRef.current.stop();
+      setIsAudioRecording(false);
+      setIsVideoRecording(false);
+      stopTimer();
+      toast.info("Recording stopped");
+    }
   };
 
   return (
     <Card className={className}>
       <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
         <h3 className="text-sm font-medium">Chat</h3>
-        {isStreaming && (
-          <div className="text-xs text-muted-foreground animate-pulse">
-            Streaming...
+        {(isAudioRecording || isVideoRecording) && (
+          <div className="flex items-center space-x-2">
+            <span className="text-sm text-muted-foreground">
+              {formatTime(recordingTime)}
+            </span>
           </div>
         )}
       </CardHeader>
       <CardContent>
         <div className="h-full flex flex-col">
-          <ScrollArea ref={scrollRef} className="flex-1 p-4 max-h-96">
+          {isVideoRecording && (
+            <div className="mb-4">
+              <video
+                ref={videoRef}
+                autoPlay
+                muted
+                className="w-full max-h-48 rounded-lg"
+              />
+            </div>
+          )}
+          <ScrollArea ref={scrollRef} className="flex-1 p-4">
             <div className="space-y-4">
               {messages.map((message) => (
                 <div
                   key={message.id}
                   className={cn(
-                    "flex flex-col max-w-[80%] rounded-lg p-3 transition-all duration-200",
+                    "flex flex-col max-w-[80%] rounded-lg p-3",
                     message.role === 'user' 
                       ? "bg-primary text-primary-foreground ml-auto" 
                       : "bg-muted"
@@ -284,7 +382,7 @@ export function ChatTab({ className }: ChatTabProps) {
                   </div>
                   <div className={cn(
                     "whitespace-pre-wrap",
-                    message.isStreaming && "after:animate-pulse"
+                    message.isStreaming 
                   )}>
                     {message.content}
                   </div>
@@ -299,27 +397,22 @@ export function ChatTab({ className }: ChatTabProps) {
                 variant="outline"
                 size="icon"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={isStreaming}
-              >
+              >``
                 <Paperclip className="h-4 w-4" />
               </Button>
               <Button
-                variant="outline"
+                variant={isAudioRecording ? "destructive" : "outline"}
                 size="icon"
-                onClick={isAudioRecording ? stopAudioRecording : startAudioRecording}
-                disabled={isStreaming}
-                className={isAudioRecording ? "bg-red-100 text-red-600" : ""}
+                onClick={isAudioRecording ? stopRecording : startAudioRecording}
               >
-                <Mic className="h-4 w-4" />
+                {isAudioRecording ? <Square className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
               </Button>
               <Button
-                variant="outline"
+                variant={isVideoRecording ? "destructive" : "outline"}
                 size="icon"
-                onClick={isVideoRecording ? stopVideoRecording : startVideoRecording}
-                disabled={isStreaming}
-                className={isVideoRecording ? "bg-red-100 text-red-600" : ""}
+                onClick={isVideoRecording ? stopRecording : startVideoRecording}
               >
-                <Video className="h-4 w-4" />
+                {isVideoRecording ? <Square className="h-4 w-4" /> : <Video className="h-4 w-4" />}
               </Button>
               <Input
                 value={input}
@@ -332,11 +425,11 @@ export function ChatTab({ className }: ChatTabProps) {
                 }}
                 placeholder="Type a message..."
                 className="flex-1"
-                disabled={!isConnected || isStreaming}
+                disabled={!isConnected}
               />
               <Button 
                 onClick={handleSendMessage}
-                disabled={!input.trim() || !isConnected || isStreaming}
+                disabled={!input.trim() && selectedFiles.length === 0 || !isConnected}
               >
                 <Send className="h-4 w-4" />
               </Button>

@@ -1,5 +1,5 @@
 'use client';
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -36,19 +36,33 @@ export function ChatTab({ className }: ChatTabProps) {
   const [selectedFiles, setSelectedFiles] = useState<Array<{ file: File; url: string }>>([]);
   const [isAudioRecording, setIsAudioRecording] = useState(false);
   const [isVideoRecording, setIsVideoRecording] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { isConnected, sessionId, selectedApp } = useWebSocketStore();
   const scrollRef = useRef<HTMLDivElement>(null);
-  const currentStreamingMessage = useRef<Message | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Smooth scrolling to bottom
+  const scrollToBottom = useCallback(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTo({
+        top: scrollRef.current.scrollHeight,
+        behavior: 'smooth'
+      });
+    }
+  }, []);
 
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [messages]);
+    scrollToBottom();
+  }, [messages, scrollToBottom]);
 
   const handleSendMessage = async () => {
-    if (!input.trim() || !isConnected) return;
+    if (!input.trim() || !isConnected || isStreaming) return;
+
+    // Cancel any ongoing streaming
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
 
     const userMessage: Message = {
       id: crypto.randomUUID(),
@@ -60,6 +74,10 @@ export function ChatTab({ className }: ChatTabProps) {
 
     setMessages(prev => [...prev, userMessage]);
     setInput("");
+    setIsStreaming(true);
+
+    // Create new abort controller for this request
+    abortControllerRef.current = new AbortController();
 
     try {
       const response = await fetch('/run_sse', {
@@ -88,90 +106,121 @@ export function ChatTab({ className }: ChatTabProps) {
           },
           streaming: true
         }),
+        signal: abortControllerRef.current.signal
       });
 
-      if (!response.ok) throw new Error('Failed to send message');
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
       const reader = response.body?.getReader();
       if (!reader) throw new Error('No reader available');
 
+      // Create streaming message
+      const streamingMessageId = crypto.randomUUID();
       const streamingMessage: Message = {
-        id: crypto.randomUUID(),
+        id: streamingMessageId,
         role: 'model',
         content: '',
-        author: '',
+        author: 'Assistant',
         timestamp: Date.now(),
         isStreaming: true,
       };
-      currentStreamingMessage.current = streamingMessage;
+
       setMessages(prev => [...prev, streamingMessage]);
 
       const decoder = new TextDecoder('utf-8');
-      let accumulatedContent = '';
-      let done = false;
+      let buffer = '';
 
-      while (!done) {
-        const { value, done: streamDone } = await reader.read();
-        done = streamDone;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          
+          if (done) break;
 
-        const chunk = decoder.decode(value || new Uint8Array(), { stream: !done });
-        const lines = chunk.split(/\r?\n/).filter(line => line.startsWith('data:'));
+          // Decode the chunk and add to buffer
+          buffer += decoder.decode(value, { stream: true });
+          
+          // Process complete lines
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
-        for (const line of lines) {
-          try {
-            const data = JSON.parse(line.replace(/^data:\s*/, ''));
-            if (data.error) {
-              toast.error(data.error);
-              return;
-            }
+          for (const line of lines) {
+            const trimmedLine = line.trim();
+            if (!trimmedLine || !trimmedLine.startsWith('data:')) continue;
 
-            const newChunk = data.content?.parts?.[0]?.text;
-            if (newChunk != null) {
-              // Only append new chunks
-              if (data.partial) {
-                accumulatedContent += newChunk;
-              } else {
-                // Final full message might be repeated — only overwrite if different
-                if (newChunk !== accumulatedContent) {
-                  accumulatedContent = newChunk;
-                }
+            try {
+              const dataStr = trimmedLine.slice(5).trim(); // Remove 'data:' prefix
+              if (dataStr === '[DONE]') {
+                // Stream completed
+                setMessages(prev => prev.map(msg => 
+                  msg.id === streamingMessageId 
+                    ? { ...msg, isStreaming: false }
+                    : msg
+                ));
+                return;
               }
-            
-              setMessages(prev => prev.map(msg => {
-                if (msg.id === currentStreamingMessage.current?.id) {
-                  return {
-                    ...msg,
-                    content: accumulatedContent,
-                    author: data.author || 'Assistant',
-                    isStreaming: data.partial ?? false,
-                  };
-                }
-                return msg;
-              }));
+
+              const data = JSON.parse(dataStr);
+              
+              if (data.error) {
+                toast.error(data.error);
+                return;
+              }
+
+              // Extract content from the response
+              const newContent = data.content?.parts?.[0]?.text;
+              const isPartial = data.partial;
+              const author = data.author || 'Assistant';
+
+              if (newContent !== undefined) {
+                setMessages(prev => prev.map(msg => {
+                  if (msg.id === streamingMessageId) {
+                    return {
+                      ...msg,
+                      content: newContent,
+                      author: author,
+                      isStreaming: isPartial !== false,
+                    };
+                  }
+                  return msg;
+                }));
+              }
+              
+            } catch (parseError) {
+              console.warn('Failed to parse SSE line:', trimmedLine, parseError);
             }
-            
-          } catch (e) {
-            console.error('Error parsing SSE data:', e);
           }
         }
+      } finally {
+        reader.releaseLock();
       }
 
-      // Final update to remove streaming state
-      setMessages(prev => prev.map(msg => {
-        if (msg.id === currentStreamingMessage.current?.id) {
-          return {
-            ...msg,
-            isStreaming: false,
-          };
-        }
-        return msg;
-      }));
-      currentStreamingMessage.current = null;
-
     } catch (error) {
-      console.error('Error:', error);
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.log('Request was aborted');
+        return;
+      }
+      
+      console.error('Streaming error:', error);
       toast.error('Failed to send message. Please try again.');
+      
+      // Remove any incomplete streaming message
+      setMessages(prev => prev.filter(msg => !msg.isStreaming));
+    } finally {
+      setIsStreaming(false);
+      abortControllerRef.current = null;
     }
   };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
@@ -210,16 +259,21 @@ export function ChatTab({ className }: ChatTabProps) {
     <Card className={className}>
       <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
         <h3 className="text-sm font-medium">Chat</h3>
+        {isStreaming && (
+          <div className="text-xs text-muted-foreground animate-pulse">
+            Streaming...
+          </div>
+        )}
       </CardHeader>
       <CardContent>
         <div className="h-full flex flex-col">
-          <ScrollArea ref={scrollRef} className="flex-1 p-4">
+          <ScrollArea ref={scrollRef} className="flex-1 p-4 max-h-96">
             <div className="space-y-4">
               {messages.map((message) => (
                 <div
                   key={message.id}
                   className={cn(
-                    "flex flex-col max-w-[80%] rounded-lg p-3",
+                    "flex flex-col max-w-[80%] rounded-lg p-3 transition-all duration-200",
                     message.role === 'user' 
                       ? "bg-primary text-primary-foreground ml-auto" 
                       : "bg-muted"
@@ -230,7 +284,7 @@ export function ChatTab({ className }: ChatTabProps) {
                   </div>
                   <div className={cn(
                     "whitespace-pre-wrap",
-                    message.isStreaming && "animate-pulse"
+                    message.isStreaming && "after:animate-pulse"
                   )}>
                     {message.content}
                   </div>
@@ -245,6 +299,7 @@ export function ChatTab({ className }: ChatTabProps) {
                 variant="outline"
                 size="icon"
                 onClick={() => fileInputRef.current?.click()}
+                disabled={isStreaming}
               >
                 <Paperclip className="h-4 w-4" />
               </Button>
@@ -252,6 +307,8 @@ export function ChatTab({ className }: ChatTabProps) {
                 variant="outline"
                 size="icon"
                 onClick={isAudioRecording ? stopAudioRecording : startAudioRecording}
+                disabled={isStreaming}
+                className={isAudioRecording ? "bg-red-100 text-red-600" : ""}
               >
                 <Mic className="h-4 w-4" />
               </Button>
@@ -259,6 +316,8 @@ export function ChatTab({ className }: ChatTabProps) {
                 variant="outline"
                 size="icon"
                 onClick={isVideoRecording ? stopVideoRecording : startVideoRecording}
+                disabled={isStreaming}
+                className={isVideoRecording ? "bg-red-100 text-red-600" : ""}
               >
                 <Video className="h-4 w-4" />
               </Button>
@@ -273,11 +332,11 @@ export function ChatTab({ className }: ChatTabProps) {
                 }}
                 placeholder="Type a message..."
                 className="flex-1"
-                disabled={!isConnected}
+                disabled={!isConnected || isStreaming}
               />
               <Button 
                 onClick={handleSendMessage}
-                disabled={!input.trim() || !isConnected}
+                disabled={!input.trim() || !isConnected || isStreaming}
               >
                 <Send className="h-4 w-4" />
               </Button>
